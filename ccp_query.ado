@@ -1,5 +1,5 @@
 *! ccp_query.ado
-*! Version 1.4.0
+*! Version 1.5.0
 *! Executes ODBC SQL queries across quarterly data archives
 *! Archives are named by scope (ca/national), quarter-month (MMYYYY), and source
 *! (attribute, trade, inquiry, public)
@@ -48,6 +48,24 @@
 *!        to each attribute record's file_date. Filter tables must be
 *!        multi-period tables (like the xwalk), not per-archive UC-CCP
 *!        tables. No changes were made to the basic_cleaning section.
+*!
+*! CHANGELOG (1.5.0):
+*!   CHANGED (basic_cleaning): geography cleaning in phase 2 is now
+*!        source-aware. Geography from the attribute tables is renamed and
+*!        checked as before; geography from a geo crosswalk joined through
+*!        extra_tables() (any table named addr_geo_xwalk*, e.g.
+*!        addr_geo_xwalk_v2) is renamed to matching geo_* names and left
+*!        otherwise untouched, since it is validated when the crosswalk is
+*!        built. If both are pulled, the attribute versions get an _attr
+*!        suffix. See section 3b. No other basic_cleaning steps changed.
+*!   FIX (basic_cleaning): the step that blanks non-numeric geography codes
+*!        compared each variable's first value, not its name, to
+*!        "geo_stabbr". It blanked every state abbreviation and stopped with
+*!        a type-mismatch error if any geo_* variable was numeric.
+*!   NEW:  an extra table's column whose name is already in the pull (e.g.
+*!        zip_cd from both attribute and the crosswalk) is now selected as
+*!        <column>_<alias> instead of producing a duplicate column, which
+*!        made the ODBC load fail.
 *!
 *! Syntax:
 *!   ccp_query, sample(ca|ntl|both) dir_varlist(path) name_output(name)
@@ -142,6 +160,18 @@ program define ccp_query
     local filter_date_expr     "attribute.file_date"   /* date type in the attribute tables */
     local filter_alias         "ccp_filter"   /* reserved SQL alias for the filter subquery */
     local filter_warn_n        5000           /* warn above this many filter values */
+
+    // --- NEW (1.5.0): geography sources for basic_cleaning (see section 3b) ---
+    //     geo_xwalk_pattern: an extra table whose name (after the schema)
+    //       matches this is treated as a geo crosswalk
+    //     geo_attr_map: attribute geography column -> cleaned name, in pairs
+    //     geo_xw_map / geo_xw_vint_map: crosswalk column -> cleaned name; the
+    //       vintage map handles <prefix>_YYYY columns. Crosswalk columns not
+    //       listed (school zones, addr_id, flags, ...) become geo_<column>.
+    local geo_xwalk_pattern "^addr_geo_xwalk"
+    local geo_attr_map    "zip_cd geo_zip state_cd geo_stabbr fips_state geo_state fips_county geo_county census_tract geo_tract census_blk_grp geo_blkgrp census_blk_id geo_blk"
+    local geo_xw_map      "zip_cd geo_zip zip_cd_reported geo_zip_reported state_cd geo_stabbr fips_state_cd geo_state county_fips3 geo_county"
+    local geo_xw_vint_map "census_tract_cd geo_tract census_blk_grp_cd geo_blkgrp census_blk_id geo_blk census_blk_full_cd geo_blkfull census_tract_geoid geo_tractid"
 
     // --- ODBC data-source name (DSN) ------------------------------------------
     local dsn  "UCCCP-Asteria"   
@@ -639,6 +669,112 @@ program define ccp_query
     }
 
     // =========================================================================
+    // 3b. NEW (1.5.0): SELECT LIST, COLUMN-NAME CLASHES, GEOGRAPHY SOURCES
+    //     Built once here (it is the same for every archive) and used in
+    //     section 6a (SELECT list) and in basic_cleaning phase 2 (geography).
+    //
+    //     Clashes: if an extra table's column name is already in the pull,
+    //       it is selected as <column>_<alias> so the ODBC load doesn't get
+    //       two columns with the same name.
+    //     Geography: records which geography columns come from the
+    //       attribute tables and which from a geo crosswalk, and the name
+    //       each gets in basic_cleaning:
+    //         attribute only  -> geo_zip, geo_stabbr, geo_state, geo_county,
+    //                            geo_tract, geo_blkgrp, geo_blk (as before)
+    //         crosswalk only  -> geo_zip, geo_stabbr, geo_state, geo_county,
+    //                            geo_tract_YYYY, geo_blkgrp_YYYY, geo_blk_YYYY,
+    //                            geo_blkfull_YYYY, geo_tractid_YYYY, and
+    //                            geo_<column> for everything else
+    //         both            -> crosswalk as above; attribute columns get
+    //                            an _attr suffix (geo_zip_attr, ...)
+    //       Every crosswalk column gets a geo_ name so it is kept as a by()
+    //       variable if phase 3 collapses tradelines to person-quarters.
+    // =========================================================================
+
+    // Which extra tables are geo crosswalks?
+    local geo_xw_aliases ""
+    forvalues k = 1/`n_extra_tables' {
+        local t_last = lower(substr("`extra_tblname_`k''", strrpos("`extra_tblname_`k''", ".") + 1, .))
+        if regexm("`t_last'", "`geo_xwalk_pattern'") {
+            local geo_xw_aliases "`geo_xw_aliases' `extra_alias_`k''"
+        }
+    }
+
+    local select_cols_all ""
+    local selected_names  ""
+    local n_geo_xw 0
+    foreach src in attribute trade inquiry public `extra_alias_list' {
+        local is_extra  : list src in extra_alias_list
+        local is_geo_xw : list src in geo_xw_aliases
+        foreach vv of local varlist_`src' {
+            local recv "`vv'"
+            local clash : list vv in selected_names
+            if `is_extra' & `clash' {
+                local recv "`vv'_`src'"
+                if length("`recv'") > 32 {
+                    di as error "Column `vv' from extra table `src' is already in the pull, and `recv' is too long to use instead. Use a shorter alias in extra_aliases()."
+                    exit 198
+                }
+                local select_cols_all "`select_cols_all', `src'.`vv' AS `recv'"
+                di as text "NOTE: `src'.`vv' is selected as `recv' (`vv' is already in the pull)."
+            }
+            else {
+                local select_cols_all "`select_cols_all', `src'.`vv'"
+            }
+            local selected_names "`selected_names' `recv'"
+
+            // Cleaned name for each crosswalk column
+            if `is_geo_xw' {
+                local t ""
+                local nm : word count `geo_xw_map'
+                forvalues w = 1(2)`nm' {
+                    if "`vv'" == "`: word `w' of `geo_xw_map''" {
+                        local t : word `=`w'+1' of `geo_xw_map'
+                    }
+                }
+                local nm : word count `geo_xw_vint_map'
+                forvalues w = 1(2)`nm' {
+                    local pfx : word `w' of `geo_xw_vint_map'
+                    if "`t'" == "" & regexm("`vv'", "^`pfx'_([0-9][0-9][0-9][0-9])$") {
+                        local t = "`: word `=`w'+1' of `geo_xw_vint_map''_" + regexs(1)
+                    }
+                }
+                if "`t'" == "" {
+                    if substr("`vv'", 1, 4) == "geo_" local t "`vv'"
+                    else                               local t "geo_`vv'"
+                }
+                if length("`t'") > 32 local t "`recv'"
+                local ++n_geo_xw
+                local geo_xw_recv_`n_geo_xw' "`recv'"
+                local geo_xw_tgt_`n_geo_xw'  "`t'"
+            }
+        }
+    }
+
+    // Attribute geography columns in the pull, and their cleaned names
+    local n_geo_attr 0
+    local nm : word count `geo_attr_map'
+    forvalues w = 1(2)`nm' {
+        local o : word `w' of `geo_attr_map'
+        if `: list o in varlist_attribute' {
+            local ++n_geo_attr
+            local geo_attr_orig_`n_geo_attr' "`o'"
+            local geo_attr_tgt_`n_geo_attr'  "`: word `=`w'+1' of `geo_attr_map''"
+            if `n_geo_xw' > 0 local geo_attr_tgt_`n_geo_attr' "`geo_attr_tgt_`n_geo_attr''_attr"
+        }
+    }
+
+    if "`basic_cleaning'" != "" & (`n_geo_attr' > 0 | `n_geo_xw' > 0) {
+        local geo_msg ""
+        if `n_geo_attr' > 0 local geo_msg "attribute tables"
+        if `n_geo_xw'   > 0 local geo_msg = trim("`geo_msg'" + cond(`n_geo_attr' > 0, " and ", "") + "geo crosswalk (" + trim("`geo_xw_aliases'") + ")")
+        di as text "Geography cleaning will use columns from: `geo_msg'"
+        if `n_geo_attr' > 0 & `n_geo_xw' > 0 {
+            di as text "  Attribute geography columns will get an _attr suffix (e.g. geo_zip_attr)."
+        }
+    }
+
+    // =========================================================================
     // 4.  PARSE archives() INTO A LIST OF MMYYYY STRINGS
     // =========================================================================
 
@@ -836,19 +972,9 @@ program define ccp_query
             }
 
             // Build SELECT column list (NEW: `extra_alias_list' appended for flexible join support)
-            local select_cols ""
-            foreach src in attribute trade inquiry public `extra_alias_list' {
-                if `"`varlist_`src''"' != "" {
-                    foreach vv of local varlist_`src' {
-                        if "`src'" == "`primary_src'" {
-                            local select_cols "`select_cols', `src'.`vv'"
-                        }
-                        else {
-                            local select_cols "`select_cols', `src'.`vv'"
-                        }
-                    }
-                }
-            }
+            // CHANGED (1.5.0): built once in section 3b, which also renames
+            // extra-table columns whose names clash with columns already pulled
+            local select_cols "`select_cols_all'"
             // Remove leading comma
             local select_cols = substr(trim("`select_cols'"), 3, .)
 
@@ -1111,38 +1237,39 @@ program define ccp_query
 				}
 				
 				* Geographies 
+				* CHANGED (1.5.0): source-aware. Which columns came from the
+				*	attribute tables and which from a geo crosswalk, and the
+				*	name each gets, are worked out in section 3b.
 				
-					//rename geo variables for consistency
-					cap confirm variable zip_cd
-						if !_rc ren zip_cd geo_zip
-						
-					cap confirm variable state_cd	
-						if !_rc ren state_cd geo_stabbr
-						
-					cap confirm variable fips_state
-						if !_rc ren fips_state geo_state
-						
-					cap confirm variable fips_county
-						if !_rc ren fips_county geo_county
-						
-					cap confirm variable census_tract
-						if !_rc ren census_tract geo_tract
-						
-					cap confirm variable census_blk_grp
-						if !_rc ren census_blk_grp geo_blkgrp
-						
-					cap confirm variable census_blk_id
-						if !_rc ren census_blk_id geo_blk
+					//(a) geography from the attribute tables: rename for
+					//	consistency (geo_zip, geo_stabbr, ..., with an _attr
+					//	suffix if a geo crosswalk is also pulled), then set
+					//	codes that are not numeric to missing.
+					//	FIX (1.5.0): the old check compared each variable's
+					//	first value, not its name, to "geo_stabbr".
+					forvalues j = 1/`n_geo_attr' {
+						cap confirm variable `geo_attr_orig_`j'', exact
+						if _rc continue
+						ren `geo_attr_orig_`j'' `geo_attr_tgt_`j''
+						if "`geo_attr_orig_`j''" == "state_cd" continue
+						cap confirm string variable `geo_attr_tgt_`j''
+						if !_rc qui replace `geo_attr_tgt_`j'' = "" if mi(real(`geo_attr_tgt_`j''))
+					}
 					
-					//some entries are not numeric; set those to missing 
-					qui cap unab vars : geo_*
-					if !_rc {
-						foreach var of varlist geo_* {
-							if `var' == "geo_stabbr" continue
-							cap confirm numeric variable `var'
-							if !_rc continue
-							qui replace `var' = "" if mi(real(`var'))
+					//(b) geography from a geo crosswalk (e.g.
+					//	addr_geo_xwalk_v2): rename only. Its codes are
+					//	validated when the crosswalk is built, and school
+					//	and district IDs must keep their leading zeros.
+					forvalues j = 1/`n_geo_xw' {
+						if "`geo_xw_recv_`j''" == "`geo_xw_tgt_`j''" continue
+						cap confirm variable `geo_xw_recv_`j'', exact
+						if _rc continue
+						cap confirm variable `geo_xw_tgt_`j'', exact
+						if !_rc {
+							if `arc_count' == 1 di as text "NOTE: kept `geo_xw_recv_`j'' as is; `geo_xw_tgt_`j'' already exists."
+							continue
 						}
+						ren `geo_xw_recv_`j'' `geo_xw_tgt_`j''
 					}
 					
 				*Person-level variables 
