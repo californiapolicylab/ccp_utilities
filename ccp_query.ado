@@ -1,5 +1,5 @@
 *! ccp_query.ado
-*! Version 1.5.0
+*! Version 1.6.0
 *! Executes ODBC SQL queries across quarterly data archives
 *! Archives are named by scope (ca/national), quarter-month (MMYYYY), and source
 *! (attribute, trade, inquiry, public)
@@ -67,6 +67,21 @@
 *!        <column>_<alias> instead of producing a duplicate column, which
 *!        made the ODBC load fail.
 *!
+*! CHANGELOG (1.6.0):
+*!   FIX:  the attribute WHERE filter now keeps Vantage scores of exactly
+*!        300 (vantage_v4_score >= 300; previously > 300). 300 is the
+*!        lowest valid score, and basic_cleaning already dropped only
+*!        scores below 300, so the two steps disagreed.
+*!   NEW:  records with a missing birth date are dropped in SQL for
+*!        archives from 2010Q2 (062010) onward, when attribute variables
+*!        are pulled. A missing birth date marks a fragment ("frag") file
+*!        in those archives. Earlier archives are not filtered on birth
+*!        date. The cutoff is set by birth_filter_start (section 0).
+*!   CHANGED (basic_cleaning): the matching drop of missing birth dates
+*!        now also starts in 2010Q2 (previously 2010Q3), so pulls with and
+*!        without basic_cleaning keep the same people. It only matters
+*!        for data that did not come through this program's SQL.
+*!
 *! Syntax:
 *!   ccp_query, sample(ca|ntl|both) dir_varlist(path) name_output(name)
 *!                   dir_output(path) archives(spec)
@@ -122,10 +137,19 @@ program define ccp_query
     //   alias changed from att. to attribute., which is the alias actually
     //   used in the FROM clause. This WHERE clause was previously never
     //   applied; it now is, whenever attribute variables are requested.
-    local sql_where_attribute "attribute.source_cd_pr='PR' AND isnull(attribute.deceased_in,'N') <> 'Y' AND attribute.vantage_v4_score IS NOT NULL AND attribute.vantage_v4_score > 300"
+    local sql_where_attribute "attribute.source_cd_pr='PR' AND isnull(attribute.deceased_in,'N') <> 'Y' AND attribute.vantage_v4_score IS NOT NULL AND attribute.vantage_v4_score >= 300"   /* CHANGED (1.6.0): >= 300 (was > 300) */
     local sql_where_trade     ""
     local sql_where_inquiry   ""
     local sql_where_public    ""
+
+    // --- NEW (1.6.0): birth-date filter for fragment records ----------------
+    //     From birth_filter_start onward (a Stata quarterly date), attribute
+    //     records with a missing birth date are fragment files and are
+    //     dropped in SQL. Applied per archive in section 6a, only when
+    //     attribute variables are pulled. Set birth_filter_start to "" to
+    //     turn the filter off.
+    local birth_filter_start "`=yq(2010, 2)'"
+    local sql_where_birth    "isnull(attribute.birth_dt_cust,'') <> ''"
 
     // --- ON clause for each LEFT JOIN (e.g. "attr.id = trade.id") -------------
     // FIX (1.2.0): renamed to full source names and aliases (att./tr. ->
@@ -1037,6 +1061,14 @@ program define ccp_query
                     }
                 }
             }
+            // NEW (1.6.0): drop records with a missing birth date (fragment
+            // files) in archives from birth_filter_start onward
+            if `"`varlist_attribute'"' != "" & "`birth_filter_start'" != "" {
+                local arc_qtr = yq(real(substr("`arc_mm_yr'", 3, 4)), real(substr("`arc_mm_yr'", 1, 2)) / 3)
+                if `arc_qtr' >= `birth_filter_start' {
+                    local where_parts "`where_parts' AND (`sql_where_birth')"
+                }
+            }
             // Add subsample restriction
             if `"`subsample'"' != "" & `"`subsample_where'"' != "" {
                 local where_parts "`where_parts' AND (`subsample_where')"
@@ -1140,8 +1172,11 @@ program define ccp_query
 				cap confirm variable birth_dt_cust
 				if !_rc {
 					
-					//missing birthdates are signs of frag files (2010Q3 onwards)
-					qui drop if mi(birth_dt_cust) & (`yr4' > 2010 | (`yr4' == 2010 & real("`mm2'") >= 9))
+					//missing birthdates are signs of frag files (2010Q2 onwards)
+					//CHANGED (1.6.0): cutoff matches the SQL filter (was 2010Q3)
+					if "`birth_filter_start'" != "" {
+						qui drop if mi(birth_dt_cust) & yq(`yr4', real("`mm2'") / 3) >= `birth_filter_start'
+					}
 						
 					//impute January birth for people w/o month (month = 00)
 					qui replace birth_dt_cust = subinstr(birth_dt_cust,"00","01",1) if ///
