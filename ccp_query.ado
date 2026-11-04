@@ -1,5 +1,5 @@
 *! ccp_query.ado
-*! Version 1.6.0
+*! Version 1.7.0
 *! Executes ODBC SQL queries across quarterly data archives
 *! Archives are named by scope (ca/national), quarter-month (MMYYYY), and source
 *! (attribute, trade, inquiry, public)
@@ -66,6 +66,14 @@
 *!        zip_cd from both attribute and the crosswalk) is now selected as
 *!        <column>_<alias> instead of producing a duplicate column, which
 *!        made the ODBC load fail.
+*!
+*! CHANGELOG (1.7.0):
+*!   CHANGED: subsample SQL now comes from ccp_subsample.ado (also in
+*!        ccp_utilities), so ccp_query and other programs that pull by
+*!        subsample (e.g. the dashboard's ccd_pull_geo) select exactly the
+*!        same people. The definitions are unchanged; they moved, and are
+*!        now wrapped in parentheses. ccp_subsample.ado must be on the
+*!        adopath.
 *!
 *! CHANGELOG (1.6.0):
 *!   FIX:  the attribute WHERE filter now keeps Vantage scores of exactly
@@ -212,16 +220,8 @@ program define ccp_query
     local alias_public    "pub"
 
     // --- Subsample WHERE fragments ------------------
-    //     Each macro should be a valid SQL WHERE-clause fragment.
-    local subsample_pt01  "substring(attribute.ctk, 12, 2) = '65' AND substring(attribute.ctk, 9, 2) = '17'"   /* 0.01 % sample */
-    local subsample_pt1   "substring(attribute.ctk, 12, 2) = '65' AND substring(attribute.ctk, 9, 1) = '1'"   /* 0.1  % sample */
-    local subsample_1     "substring(attribute.ctk, 12, 2) = '65'"   /* 1    % sample */
-    local subsample_2     "substring(attribute.ctk, 12, 2) = '64' OR substring(attribute.ctk, 12, 2) = '69'"   /* 2    % sample */
-    local subsample_5     "(substring(attribute.ctk, 12, 2) = '17' OR substring(attribute.ctk, 12, 2) = '32' OR substring(attribute.ctk, 12, 2) = '85' OR substring(attribute.ctk, 12, 2) = '90' OR substring(attribute.ctk, 12, 2) = '56')"   /* 5    % sample */
-    local subsample_10    "substring(attribute.ctk, 12, 1) = '1'"   /* 10   % sample */
-    local subsample_20    "(substring(attribute.ctk, 12, 1) = '1' OR substring(attribute.ctk, 12, 1) = '7')"   /* 20   % sample */
-    local subsample_50    "(substring(attribute.ctk, 12, 1) = '1' OR substring(attribute.ctk, 12, 1) = '7' OR substring(attribute.ctk, 12, 1) = '2' OR substring(attribute.ctk, 12, 1) = '5' OR substring(attribute.ctk, 12, 1) = '8')"   /* 50   % sample */
-    local subsample_100   ""   /* 100  % (full) sample */
+    //     CHANGED (1.7.0): defined in ccp_subsample.ado, shared with other
+    //     programs that pull by subsample. Edit them there.
 
     // =========================================================================
     // 1.  VALIDATE AND NORMALISE sample() ARGUMENT
@@ -249,6 +249,13 @@ program define ccp_query
     // 2.  VALIDATE subsample() ARGUMENT (if supplied)
     // =========================================================================
 
+    // NEW (1.7.0): subsample SQL lives in ccp_subsample.ado
+    capture which ccp_subsample
+    if _rc {
+        di as error "ccp_query requires ccp_subsample.ado (in the ccp_utilities repo) on the adopath."
+        exit 199
+    }
+
 	* If subsample is provided, check that it makes sense and define SQL
 	*	code appropriately
     if `"`subsample'"' != "" {
@@ -262,8 +269,10 @@ program define ccp_query
             di as error "subsample() must be one of: pt01 pt1 1 2 5 10 20 50 100"
             exit 198
         }
-        // Map subsample value to the appropriate programmer-defined macro
-        local subsample_where "`subsample_`sub_lc''"
+        // CHANGED (1.7.0): SQL comes from the shared ccp_subsample.ado
+        local subsample "`sub_lc'"
+        ccp_subsample `sub_lc', column(attribute.ctk)
+        local subsample_where `"`r(where)'"'
     }
 
 	* If subsample isn't provided, default to the 0.01% sample (smallest) and 
@@ -277,7 +286,8 @@ program define ccp_query
 			di as text "	filter_file() is applied within that 0.01% sample. Use subsample(100) to get everyone matching the filter."
 		}
 		local subsample "pt01"
-		local subsample_where "`subsample_pt01'"
+		ccp_subsample pt01, column(attribute.ctk)   /* CHANGED (1.7.0) */
+		local subsample_where `"`r(where)'"'
 	}
 	
     // =========================================================================
