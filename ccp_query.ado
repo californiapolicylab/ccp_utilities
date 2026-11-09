@@ -1,5 +1,5 @@
 *! ccp_query.ado
-*! Version 1.7.0
+*! Version 1.8.0
 *! Executes ODBC SQL queries across quarterly data archives
 *! Archives are named by scope (ca/national), quarter-month (MMYYYY), and source
 *! (attribute, trade, inquiry, public)
@@ -67,6 +67,38 @@
 *!        <column>_<alias> instead of producing a duplicate column, which
 *!        made the ODBC load fail.
 *!
+*! CHANGELOG (1.8.0):
+*!   NEW:  location / location_geo() / location_drop() add where each person
+*!        lived on the archive's date, from constructed_data.addr_spells
+*!        (see section 2d). The archive's date comes from its table name
+*!        (e.g. 062018 -> 2018-06-01), not from file_date. Adds
+*!        geo_loc_status, which is one of:
+*!          known_address     located at a hashed address
+*!          unknown_address   moved; location from the quarterly archives
+*!          not_yet_hashed    before the person's first hashed location
+*!          no_longer_hashed  after the person's last location (records in
+*!                            this period are mostly stale)
+*!          never_hashed      never in a hashed March archive
+*!        plus geo_loc_addr_id, geo_loc_bldg_id, geo_loc_zip, geo_loc_state,
+*!        geo_loc_county, geo_loc_valid_from and geo_loc_valid_to.
+*!        location_geo() adds columns from constructed_data.addr_bldg_geography
+*!        as geo_loc_<column>; tract and school-zone columns also fall back
+*!        on the spell's own values for address-unknown spells.
+*!        location_drop() drops records with the listed statuses in SQL,
+*!        e.g. location_drop(no_longer_hashed).
+*!   NEW:  the driver file can also list columns with source = addr_spells
+*!        or source = addr_bldg_geography, like an extra table. Either
+*!        source turns on location (the joins and geo_loc_status are added
+*!        automatically); no extra_tables() entry is needed, since these
+*!        tables are joined by date range, not by key. addr_bldg_geography
+*!        tract and school-zone columns fall back on the spell's own values
+*!        for address-unknown spells. Name clashes get a suffix (_loc for
+*!        addr_spells, _bg for addr_bldg_geography), and basic_cleaning
+*!        renames these columns like a geo crosswalk's (geo_zip,
+*!        geo_tractid_2010, geo_<column>, ...).
+*!        All location features require attribute variables in the pull.
+*!        No changes were made to the basic_cleaning section itself.
+*!
 *! CHANGELOG (1.7.0):
 *!   CHANGED: subsample SQL now comes from ccp_subsample.ado (also in
 *!        ccp_utilities), so ccp_query and other programs that pull by
@@ -98,7 +130,11 @@
 *!                   extra_aliases(alias1 alias2 ...)
 *!                   parquet pqsave_options(string)
 *!                   filter_file(path.csv) filter_table(tbl)
-*!                   filter_mode(ever|archive)]
+*!                   filter_mode(ever|archive)
+*!                   location location_geo(col1 col2 ...)
+*!                   location_drop(status1 status2 ...)]
+*!   Driver-file sources (1.8.0): attribute | trade | inquiry | public |
+*!                   <extra table alias> | addr_spells | addr_bldg_geography
 cap program drop ccp_query
 program define ccp_query
     version 16.0
@@ -122,6 +158,9 @@ program define ccp_query
         filter_file(string)     /// NEW (1.4.0): CSV with one column; header = filter-table column name, rows = values to keep
         filter_table(string)    /// NEW (1.4.0): table the filter values are looked up in (default constructed_data.addr_geo_xwalk)
         filter_mode(string)     /// NEW (1.4.0): ever (default) | archive
+        location                /// NEW (1.8.0): add location status and geography from addr_spells
+        location_geo(string)    /// NEW (1.8.0): columns of addr_bldg_geography to add (implies location)
+        location_drop(string)   /// NEW (1.8.0): location statuses to drop in SQL (implies location)
         ]
 
     // =========================================================================
@@ -192,6 +231,25 @@ program define ccp_query
     local filter_date_expr     "attribute.file_date"   /* date type in the attribute tables */
     local filter_alias         "ccp_filter"   /* reserved SQL alias for the filter subquery */
     local filter_warn_n        5000           /* warn above this many filter values */
+
+    // --- NEW (1.8.0): location from address spells (see section 2d) ----------
+    //     loc_spells_tbl: one row per person per stay (or no-location period),
+    //       valid_from / valid_to dates covering whole quarters
+    //     loc_bldg_tbl:   one row per building, census geography and school zones
+    //     loc_alias / loc_g_alias: reserved SQL aliases for the two joins
+    local loc_spells_tbl  "constructed_data.addr_spells"
+    local loc_bldg_tbl    "constructed_data.addr_bldg_geography"
+    local loc_alias       "ccp_loc"
+    local loc_g_alias     "ccp_locg"
+    local loc_statuses    "known_address unknown_address not_yet_hashed no_longer_hashed never_hashed"
+    //     driver-file source names for the two tables, and the suffix a column
+    //     gets if its name is already in the pull
+    local loc_sources     "addr_spells addr_bldg_geography"
+    local loc_sfx_addr_spells         "loc"
+    local loc_sfx_addr_bldg_geography "bg"
+    //     addr_bldg_geography columns that address-unknown spells also carry
+    //     (used as a fallback in location_geo())
+    local loc_spell_fallback "primary_school_name primary_school_id primary_lea_id middle_school_name middle_school_id middle_lea_id high_school_name high_school_id high_lea_id"
 
     // --- NEW (1.5.0): geography sources for basic_cleaning (see section 3b) ---
     //     geo_xwalk_pattern: an extra table whose name (after the schema)
@@ -380,7 +438,7 @@ program define ccp_query
         // Validate aliases: SQL/Stata-safe identifiers, short enough to fit
         // in Stata macro names (31-char limit, less the 8-char "varlist_"
         // prefix), not colliding with built-in sources or each other
-        local seen_aliases "attribute trade inquiry public `filter_alias'"   /* CHANGED (1.4.0): filter alias reserved */
+        local seen_aliases "attribute trade inquiry public `filter_alias' `loc_alias' `loc_g_alias' `loc_sources'"   /* CHANGED (1.4.0, 1.8.0): filter and location aliases reserved */
         foreach a of local extra_alias_list {
             if !regexm("`a'", "^[a-z_][a-z0-9_]*$") | length("`a'") > 23 {
                 di as error `"extra table alias "`a'" is invalid: use letters, digits, and underscores only (max 23 characters). Supply extra_aliases() to set one explicitly."'
@@ -557,6 +615,71 @@ program define ccp_query
     }
 
     // =========================================================================
+    // 2d. NEW (1.8.0): PARSE location / location_geo() / location_drop()
+    //     Adds where each person lived on the archive's date, from the
+    //     address spells. Per archive (section 6a) this becomes:
+    //       LEFT JOIN <loc_spells_tbl> AS ccp_loc
+    //         ON ccp_loc.ctk = attribute.ctk
+    //        AND DATEFROMPARTS(<yyyy>, <mm>, 1) BETWEEN ccp_loc.valid_from
+    //                                              AND ccp_loc.valid_to
+    //       [LEFT JOIN <loc_bldg_tbl> AS ccp_locg
+    //         ON ccp_locg.bldg_id = ccp_loc.bldg_id]   (only with location_geo())
+    //     The date comes from the archive's name, so it never depends on
+    //     file_date, which is inconsistent across archives. Spells cover whole
+    //     quarters, so the first of the archive month always falls inside
+    //     the right one.
+    //
+    //       location               add geo_loc_status and the spell's IDs,
+    //                              ZIP, state, county and dates
+    //       location_geo(cols)     also add these addr_bldg_geography columns,
+    //                              as geo_loc_<col> (e.g. census_tract_geoid_2010,
+    //                              primary_school_id)
+    //       location_drop(stats)   drop records with these statuses in SQL
+    //                              (from loc_statuses), e.g. no_longer_hashed
+    //     The driver file can also list columns with source = addr_spells or
+    //     addr_bldg_geography, which turns location on as well (section 3c).
+    // =========================================================================
+
+    // geo_loc_status: the spell type, or for no-location rows the reason, or
+    // never_hashed when the person has no rows at all
+    local loc_status_expr "COALESCE(IIF(`loc_alias'.spell_type = 'no_location', `loc_alias'.start_basis, `loc_alias'.spell_type), 'never_hashed')"
+
+    local has_location 0
+    local loc_drop_sql ""
+    local loc_geo_cols ""
+    local loc_drop_list ""
+    if "`location'" != "" | `"`location_geo'"' != "" | `"`location_drop'"' != "" {
+        local has_location 1
+
+        // location_geo(): validate the column names (the SELECT is built in
+        // section 3c, together with any addr_spells / addr_bldg_geography
+        // columns listed in the driver file)
+        local loc_geo_cols = lower(trim(`"`location_geo'"'))
+        foreach c of local loc_geo_cols {
+            if !regexm("`c'", "^[a-z_][a-z0-9_]*$") | length("geo_loc_`c'") > 32 {
+                di as error `"location_geo(): "`c'" is not a valid column name (letters, digits, underscores; at most 24 characters)."'
+                exit 198
+            }
+        }
+
+        // location_drop(): validate and build the SQL list
+        local loc_drop_list = lower(trim(`"`location_drop'"'))
+        local loc_drop_in ""
+        foreach st of local loc_drop_list {
+            if !`: list st in loc_statuses' {
+                di as error `"location_drop(): "`st'" is not a location status. Use any of: `loc_statuses'."'
+                exit 198
+            }
+            local loc_drop_in "`loc_drop_in', '`st''"
+        }
+        if "`loc_drop_in'" != "" {
+            local loc_drop_in = substr("`loc_drop_in'", 3, .)
+            local loc_drop_sql "`loc_status_expr' NOT IN (`loc_drop_in')"
+        }
+    }
+
+
+    // =========================================================================
     // 3.  READ VARIABLE LIST FROM EXCEL
     // =========================================================================
 
@@ -596,7 +719,7 @@ program define ccp_query
 
         // Validate source values
 		local incl_tradeline = 0
-        local valid_sources "attribute trade inquiry public `extra_alias_list'"   /* NEW: extra_alias_list appended for flexible join support */
+        local valid_sources "attribute trade inquiry public `extra_alias_list' `loc_sources'"   /* NEW: extra_alias_list appended for flexible join support; loc_sources (1.8.0) */
         quietly glevelsof source, local(src_vals) clean
         foreach sv of local src_vals {
             local sv_lc = lower(trim("`sv'"))
@@ -612,7 +735,7 @@ program define ccp_query
         }
 		
         // Build per-source variable lists (NEW: `extra_alias_list' appended for flexible join support)
-        foreach src in attribute trade inquiry public `extra_alias_list' {
+        foreach src in attribute trade inquiry public `extra_alias_list' `loc_sources' {
             local varlist_`src' ""
         }
 
@@ -647,6 +770,10 @@ program define ccp_query
             if `has_expr' {
                 local vexpr = trim(expression[`i'])
                 if `"`vexpr'"' != "" {
+                    if `: list vsrc in loc_sources' {
+                        di as error `"Derived fields are not supported for source `vsrc' (variable `vname')."'
+                        exit 198
+                    }
                     if !regexm("`vname'", "^[a-z_][a-z0-9_]*$") | length("`vname'") > 32 {
                         di as error `"Derived field name "`vname'" is invalid: use letters, digits, and underscores only (max 32 characters)."'
                         exit 198
@@ -661,7 +788,7 @@ program define ccp_query
 
         // Determine which sources are actually needed (NEW: `extra_alias_list' appended for flexible join support)
         local active_sources ""
-        foreach src in attribute trade inquiry public `extra_alias_list' {
+        foreach src in attribute trade inquiry public `extra_alias_list' `loc_sources' {
             local varlist_`src' = trim(`"`varlist_`src''"')
             if `"`varlist_`src''"' != "" {
                 local active_sources "`active_sources' `src'"
@@ -679,6 +806,17 @@ program define ccp_query
     // include the attribute source (which is then the primary source)
     if `has_filter' & `"`varlist_attribute'"' == "" {
         di as error "filter_file() requires at least one attribute variable in the driver file (e.g. ctk with source = attribute)."
+        exit 198
+    }
+
+    // NEW (1.8.0): driver-file columns from addr_spells / addr_bldg_geography
+    // turn location on
+    if `"`varlist_addr_spells'`varlist_addr_bldg_geography'"' != "" local has_location 1
+
+    // NEW (1.8.0): location joins on attribute.ctk, so the pull must include
+    // the attribute source (which is then the primary source)
+    if `has_location' & `"`varlist_attribute'"' == "" {
+        di as error "location, location_geo(), location_drop() and the addr_spells / addr_bldg_geography sources require at least one attribute variable in the driver file (e.g. ctk with source = attribute)."
         exit 198
     }
 
@@ -725,7 +863,8 @@ program define ccp_query
     //       variable if phase 3 collapses tradelines to person-quarters.
     // =========================================================================
 
-    // Which extra tables are geo crosswalks?
+    // Which extra tables are geo crosswalks? (NEW 1.8.0: the location
+    // sources are treated as crosswalks for geography naming)
     local geo_xw_aliases ""
     forvalues k = 1/`n_extra_tables' {
         local t_last = lower(substr("`extra_tblname_`k''", strrpos("`extra_tblname_`k''", ".") + 1, .))
@@ -737,13 +876,43 @@ program define ccp_query
     local select_cols_all ""
     local selected_names  ""
     local n_geo_xw 0
-    foreach src in attribute trade inquiry public `extra_alias_list' {
+    foreach src in `loc_sources' {
+        if `"`varlist_`src''"' != "" local geo_xw_aliases "`geo_xw_aliases' `src'"
+    }
+
+    foreach src in attribute trade inquiry public `extra_alias_list' `loc_sources' {
         local is_extra  : list src in extra_alias_list
+        local is_loc    : list src in loc_sources
         local is_geo_xw : list src in geo_xw_aliases
         foreach vv of local varlist_`src' {
             local recv "`vv'"
             local clash : list vv in selected_names
-            if `is_extra' & `clash' {
+            if `is_loc' {
+                // NEW (1.8.0): location sources. SQL alias, fallback on the
+                // spell's own values for address-unknown spells, and a short
+                // suffix on a name clash
+                if `clash' local recv "`vv'_`loc_sfx_`src''"
+                if length("`recv'") > 32 {
+                    di as error "Column `vv' (source `src') is already in the pull, and `recv' is too long to use instead."
+                    exit 198
+                }
+                if "`src'" == "addr_spells" {
+                    local e "`loc_alias'.`vv'"
+                }
+                else if regexm("`vv'", "^census_tract_geoid_(2000|2010|2020)$") {
+                    local v = regexs(1)
+                    local e "COALESCE(`loc_g_alias'.`vv', IIF(`loc_alias'.tract_vintage = `v', `loc_alias'.tract_geoid, NULL))"
+                }
+                else if `: list vv in loc_spell_fallback' {
+                    local e "COALESCE(`loc_g_alias'.`vv', `loc_alias'.`vv')"
+                }
+                else {
+                    local e "`loc_g_alias'.`vv'"
+                }
+                local select_cols_all "`select_cols_all', `e' AS `recv'"
+                if "`recv'" != "`vv'" di as text "NOTE: `src'.`vv' is selected as `recv' (`vv' is already in the pull)."
+            }
+            else if `is_extra' & `clash' {
                 local recv "`vv'_`src'"
                 if length("`recv'") > 32 {
                     di as error "Column `vv' from extra table `src' is already in the pull, and `recv' is too long to use instead. Use a shorter alias in extra_aliases()."
@@ -806,6 +975,57 @@ program define ccp_query
         if `n_geo_attr' > 0 & `n_geo_xw' > 0 {
             di as text "  Attribute geography columns will get an _attr suffix (e.g. geo_zip_attr)."
         }
+    }
+
+    // =========================================================================
+    // 3c. NEW (1.8.0): LOCATION SELECT LIST AND JOINS
+    //     Whenever location is on (options or driver-file sources), every
+    //     archive gets geo_loc_status and the spell's IDs, ZIP, state, county
+    //     and dates, plus any location_geo() columns. The building table is
+    //     joined only if a column from it is needed.
+    // =========================================================================
+
+    local loc_select ""
+    local loc_need_bldg 0
+    if `has_location' {
+        local loc_select ", `loc_status_expr' AS geo_loc_status"
+        local loc_select "`loc_select', `loc_alias'.addr_id AS geo_loc_addr_id, `loc_alias'.bldg_id AS geo_loc_bldg_id"
+        local loc_select "`loc_select', `loc_alias'.zip_cd AS geo_loc_zip, `loc_alias'.fips_state_cd AS geo_loc_state, `loc_alias'.county_fips3 AS geo_loc_county"
+        local loc_select "`loc_select', `loc_alias'.valid_from AS geo_loc_valid_from, `loc_alias'.valid_to AS geo_loc_valid_to"
+        local loc_names "geo_loc_status geo_loc_addr_id geo_loc_bldg_id geo_loc_zip geo_loc_state geo_loc_county geo_loc_valid_from geo_loc_valid_to"
+
+        // location_geo(): building columns, with a fallback on the spell's own
+        // values where address-unknown spells carry the same information
+        foreach c of local loc_geo_cols {
+            if regexm("`c'", "^census_tract_geoid_(2000|2010|2020)$") {
+                local v = regexs(1)
+                local e "COALESCE(`loc_g_alias'.`c', IIF(`loc_alias'.tract_vintage = `v', `loc_alias'.tract_geoid, NULL))"
+            }
+            else if `: list c in loc_spell_fallback' {
+                local e "COALESCE(`loc_g_alias'.`c', `loc_alias'.`c')"
+            }
+            else {
+                local e "`loc_g_alias'.`c'"
+            }
+            local loc_select "`loc_select', `e' AS geo_loc_`c'"
+            local loc_names "`loc_names' geo_loc_`c'"
+        }
+        if "`loc_geo_cols'" != "" | `"`varlist_addr_bldg_geography'"' != "" local loc_need_bldg 1
+
+        // The location variables must not clash with pulled columns
+        foreach nm of local loc_names {
+            if `: list nm in selected_names' {
+                di as error "The driver file pulls a column named `nm', which location also creates. Rename or remove it."
+                exit 198
+            }
+        }
+
+        di as text "Location from address spells (`loc_spells_tbl'):"
+        di as text "  adds geo_loc_status and the spell's IDs, ZIP, state, county and dates"
+        if `"`varlist_addr_spells'"' != "" di as text "  driver-file columns from addr_spells: `varlist_addr_spells'"
+        if `"`varlist_addr_bldg_geography'"' != "" di as text "  driver-file columns from addr_bldg_geography: `varlist_addr_bldg_geography'"
+        if "`loc_geo_cols'" != "" di as text "  location_geo() columns (`loc_bldg_tbl'): `loc_geo_cols'"
+        if "`loc_drop_list'" != "" di as text "  dropping records with status: `loc_drop_list'"
     }
 
     // =========================================================================
@@ -1011,6 +1231,10 @@ program define ccp_query
             local select_cols "`select_cols_all'"
             // Remove leading comma
             local select_cols = substr(trim("`select_cols'"), 3, .)
+            // NEW (1.8.0): location variables (see section 2d)
+            if `has_location' {
+                local select_cols `"`select_cols' `loc_select'"'
+            }
 
             // Build FROM clause  (primary source)
             local tbl_base "`tbl_scope'_`arc_mm_yr'_`primary_src'"   /* CHANGED: scope -> tbl_scope */
@@ -1062,6 +1286,18 @@ program define ccp_query
             }
 
 			
+            // NEW (1.8.0): location joins (see section 2d). The archive's date
+            // comes from its name: MMYYYY -> DATEFROMPARTS(YYYY, MM, 1)
+            if `has_location' {
+                local loc_yyyy = substr("`arc_mm_yr'", 3, 4)
+                local loc_mm   = real(substr("`arc_mm_yr'", 1, 2))
+                local loc_date "DATEFROMPARTS(`loc_yyyy', `loc_mm', 1)"
+                local join_clauses `"`join_clauses' LEFT JOIN `loc_spells_tbl' AS `loc_alias' ON `loc_alias'.ctk = attribute.ctk AND `loc_date' BETWEEN `loc_alias'.valid_from AND `loc_alias'.valid_to"'
+                if `loc_need_bldg' {
+                    local join_clauses `"`join_clauses' LEFT JOIN `loc_bldg_tbl' AS `loc_g_alias' ON `loc_g_alias'.bldg_id = `loc_alias'.bldg_id"'
+                }
+            }
+
             // Build WHERE clause
             local where_parts ""
             foreach src in attribute trade inquiry public {
@@ -1082,6 +1318,10 @@ program define ccp_query
             // Add subsample restriction
             if `"`subsample'"' != "" & `"`subsample_where'"' != "" {
                 local where_parts "`where_parts' AND (`subsample_where')"
+            }
+            // NEW (1.8.0): location_drop() (see section 2d)
+            if "`loc_drop_sql'" != "" {
+                local where_parts "`where_parts' AND (`loc_drop_sql')"
             }
             // NEW (1.4.0): add filter_file() restriction (see section 2c)
             if `has_filter' {
