@@ -79,20 +79,22 @@
 *!          no_longer_hashed  after the person's last location (records in
 *!                            this period are mostly stale)
 *!          never_hashed      never in a hashed March archive
-*!        plus geo_loc_addr_id, geo_loc_bldg_id, geo_loc_zip, geo_loc_state,
-*!        geo_loc_county, geo_loc_valid_from and geo_loc_valid_to.
-*!        location_geo() adds columns from constructed_data.addr_bldg_geography
-*!        as geo_loc_<column>; tract and school-zone columns also fall back
-*!        on the spell's own values for address-unknown spells.
+*!        plus geo_loc_addr_id, geo_loc_bldg_id, geo_loc_zip,
+*!        geo_loc_state_fips, geo_loc_county_geoid, geo_loc_valid_from and
+*!        geo_loc_valid_to.
+*!        location_geo() adds more columns as geo_loc_<column>: any column of
+*!        addr_spells (e.g. tract_geoid_10, block_geoid_20, geo_src_20,
+*!        primary_school_id), which carries every spell's geography, or any
+*!        building-level column of addr_bldg_geography (e.g. county_source).
 *!        location_drop() drops records with the listed statuses in SQL,
 *!        e.g. location_drop(no_longer_hashed).
 *!   NEW:  the driver file can also list columns with source = addr_spells
 *!        or source = addr_bldg_geography, like an extra table. Either
 *!        source turns on location (the joins and geo_loc_status are added
 *!        automatically); no extra_tables() entry is needed, since these
-*!        tables are joined by date range, not by key. addr_bldg_geography
-*!        tract and school-zone columns fall back on the spell's own values
-*!        for address-unknown spells. Name clashes get a suffix (_loc for
+*!        tables are joined by date range, not by key. Prefer addr_spells for
+*!        geography: it has every spell's codes, while addr_bldg_geography
+*!        only covers known addresses. Name clashes get a suffix (_loc for
 *!        addr_spells, _bg for addr_bldg_geography), and basic_cleaning
 *!        renames these columns like a geo crosswalk's (geo_zip,
 *!        geo_tractid_2010, geo_<column>, ...).
@@ -247,9 +249,11 @@ program define ccp_query
     local loc_sources     "addr_spells addr_bldg_geography"
     local loc_sfx_addr_spells         "loc"
     local loc_sfx_addr_bldg_geography "bg"
-    //     addr_bldg_geography columns that address-unknown spells also carry
-    //     (used as a fallback in location_geo())
-    local loc_spell_fallback "primary_school_name primary_school_id primary_lea_id middle_school_name middle_school_id middle_lea_id high_school_name high_school_id high_lea_id"
+    //     Columns of addr_spells. addr_spells carries every spell's geography
+    //     (2000/2010/2020 tract, block group and block GEOIDs, school zones),
+    //     so location_geo() reads these from it directly; any other column
+    //     comes from addr_bldg_geography (building-level details)
+    local loc_spell_cols "zip state_fips county_geoid tract_geoid_00 tract_geoid_10 tract_geoid_20 blkgrp_geoid_00 blkgrp_geoid_10 blkgrp_geoid_20 block_geoid_00 block_geoid_10 block_geoid_20 geo_src_00 geo_src_10 geo_src_20 primary_school_name primary_school_id primary_lea_id middle_school_name middle_school_id middle_lea_id high_school_name high_school_id high_lea_id spell_type start_basis end_basis first_anchor_date last_anchor_date blips_merged zip_state_conflict"
 
     // --- NEW (1.5.0): geography sources for basic_cleaning (see section 3b) ---
     //     geo_xwalk_pattern: an extra table whose name (after the schema)
@@ -631,9 +635,10 @@ program define ccp_query
     //
     //       location               add geo_loc_status and the spell's IDs,
     //                              ZIP, state, county and dates
-    //       location_geo(cols)     also add these addr_bldg_geography columns,
-    //                              as geo_loc_<col> (e.g. census_tract_geoid_2010,
-    //                              primary_school_id)
+    //       location_geo(cols)     also add these columns, as geo_loc_<col>:
+    //                              from addr_spells when it has them (e.g.
+    //                              tract_geoid_10, block_geoid_20,
+    //                              primary_school_id), else addr_bldg_geography
     //       location_drop(stats)   drop records with these statuses in SQL
     //                              (from loc_statuses), e.g. no_longer_hashed
     //     The driver file can also list columns with source = addr_spells or
@@ -888,27 +893,15 @@ program define ccp_query
             local recv "`vv'"
             local clash : list vv in selected_names
             if `is_loc' {
-                // NEW (1.8.0): location sources. SQL alias, fallback on the
-                // spell's own values for address-unknown spells, and a short
+                // NEW (1.8.0): location sources: SQL alias, and a short
                 // suffix on a name clash
                 if `clash' local recv "`vv'_`loc_sfx_`src''"
                 if length("`recv'") > 32 {
                     di as error "Column `vv' (source `src') is already in the pull, and `recv' is too long to use instead."
                     exit 198
                 }
-                if "`src'" == "addr_spells" {
-                    local e "`loc_alias'.`vv'"
-                }
-                else if regexm("`vv'", "^census_tract_geoid_(2000|2010|2020)$") {
-                    local v = regexs(1)
-                    local e "COALESCE(`loc_g_alias'.`vv', IIF(`loc_alias'.tract_vintage = `v', `loc_alias'.tract_geoid, NULL))"
-                }
-                else if `: list vv in loc_spell_fallback' {
-                    local e "COALESCE(`loc_g_alias'.`vv', `loc_alias'.`vv')"
-                }
-                else {
-                    local e "`loc_g_alias'.`vv'"
-                }
+                if "`src'" == "addr_spells" local e "`loc_alias'.`vv'"
+                else                        local e "`loc_g_alias'.`vv'"
                 local select_cols_all "`select_cols_all', `e' AS `recv'"
                 if "`recv'" != "`vv'" di as text "NOTE: `src'.`vv' is selected as `recv' (`vv' is already in the pull)."
             }
@@ -990,27 +983,25 @@ program define ccp_query
     if `has_location' {
         local loc_select ", `loc_status_expr' AS geo_loc_status"
         local loc_select "`loc_select', `loc_alias'.addr_id AS geo_loc_addr_id, `loc_alias'.bldg_id AS geo_loc_bldg_id"
-        local loc_select "`loc_select', `loc_alias'.zip_cd AS geo_loc_zip, `loc_alias'.fips_state_cd AS geo_loc_state, `loc_alias'.county_fips3 AS geo_loc_county"
+        local loc_select "`loc_select', `loc_alias'.zip AS geo_loc_zip, `loc_alias'.state_fips AS geo_loc_state_fips, `loc_alias'.county_geoid AS geo_loc_county_geoid"
         local loc_select "`loc_select', `loc_alias'.valid_from AS geo_loc_valid_from, `loc_alias'.valid_to AS geo_loc_valid_to"
-        local loc_names "geo_loc_status geo_loc_addr_id geo_loc_bldg_id geo_loc_zip geo_loc_state geo_loc_county geo_loc_valid_from geo_loc_valid_to"
+        local loc_names "geo_loc_status geo_loc_addr_id geo_loc_bldg_id geo_loc_zip geo_loc_state_fips geo_loc_county_geoid geo_loc_valid_from geo_loc_valid_to"
 
-        // location_geo(): building columns, with a fallback on the spell's own
-        // values where address-unknown spells carry the same information
+        // location_geo(): from addr_spells when it carries the column (all
+        // census geography and school zones), else from addr_bldg_geography
+        local loc_geo_bldg ""
         foreach c of local loc_geo_cols {
-            if regexm("`c'", "^census_tract_geoid_(2000|2010|2020)$") {
-                local v = regexs(1)
-                local e "COALESCE(`loc_g_alias'.`c', IIF(`loc_alias'.tract_vintage = `v', `loc_alias'.tract_geoid, NULL))"
-            }
-            else if `: list c in loc_spell_fallback' {
-                local e "COALESCE(`loc_g_alias'.`c', `loc_alias'.`c')"
+            if `: list c in loc_spell_cols' {
+                local e "`loc_alias'.`c'"
             }
             else {
                 local e "`loc_g_alias'.`c'"
+                local loc_geo_bldg "`loc_geo_bldg' `c'"
             }
             local loc_select "`loc_select', `e' AS geo_loc_`c'"
             local loc_names "`loc_names' geo_loc_`c'"
         }
-        if "`loc_geo_cols'" != "" | `"`varlist_addr_bldg_geography'"' != "" local loc_need_bldg 1
+        if trim("`loc_geo_bldg'") != "" | `"`varlist_addr_bldg_geography'"' != "" local loc_need_bldg 1
 
         // The location variables must not clash with pulled columns
         foreach nm of local loc_names {
@@ -1024,7 +1015,7 @@ program define ccp_query
         di as text "  adds geo_loc_status and the spell's IDs, ZIP, state, county and dates"
         if `"`varlist_addr_spells'"' != "" di as text "  driver-file columns from addr_spells: `varlist_addr_spells'"
         if `"`varlist_addr_bldg_geography'"' != "" di as text "  driver-file columns from addr_bldg_geography: `varlist_addr_bldg_geography'"
-        if "`loc_geo_cols'" != "" di as text "  location_geo() columns (`loc_bldg_tbl'): `loc_geo_cols'"
+        if "`loc_geo_cols'" != "" di as text "  location_geo() columns: `loc_geo_cols'"
         if "`loc_drop_list'" != "" di as text "  dropping records with status: `loc_drop_list'"
     }
 
