@@ -83,11 +83,23 @@
 *!        geo_loc_state_fips, geo_loc_county_geoid, geo_loc_valid_from and
 *!        geo_loc_valid_to.
 *!        location_geo() adds more columns as geo_loc_<column>: any column of
-*!        addr_spells (e.g. tract_geoid_10, block_geoid_20, geo_src_20,
-*!        primary_school_id), which carries every spell's geography, or any
-*!        building-level column of addr_bldg_geography (e.g. county_source).
+*!        addr_spells (e.g. tract_geoid_10, block_geoid_20, geo_src_20),
+*!        which carries every spell's geography, or any building-level
+*!        column of addr_bldg_geography (e.g. county_source).
+*!   CHANGED: basic_cleaning recognises the crosswalk's new column names
+*!        (zip, zip_reported, state_fips, county_geoid; the table is now
+*!        addr_geo_xwalk) as well as the old ones. School zones are no longer
+*!        columns of addr_spells / addr_geo_xwalk: they live in the block-based
+*!        reference table ref_blk_school_zone. filter_file() works on any
+*!        addr_geo_xwalk column (county_geoid, tract_geoid_10, zip, ...);
+*!        filtering by school zone needs a join through ref_blk_school_zone,
+*!        which is not supported yet.
 *!        location_drop() drops records with the listed statuses in SQL,
 *!        e.g. location_drop(no_longer_hashed).
+*!   FIXED: memory is now emptied explicitly before each archive's query
+*!        (odbc load's clear option did not always do so, and the second
+*!        archive could fail with r(18) "you must start with an empty
+*!        dataset"); a failed query now shows the ODBC / SQL Server message.
 *!   NEW:  the driver file can also list columns with source = addr_spells
 *!        or source = addr_bldg_geography, like an extra table. Either
 *!        source turns on location (the joins and geo_loc_status are added
@@ -237,7 +249,7 @@ program define ccp_query
     // --- NEW (1.8.0): location from address spells (see section 2d) ----------
     //     loc_spells_tbl: one row per person per stay (or no-location period),
     //       valid_from / valid_to dates covering whole quarters
-    //     loc_bldg_tbl:   one row per building, census geography and school zones
+    //     loc_bldg_tbl:   one row per building, census geography and building details
     //     loc_alias / loc_g_alias: reserved SQL aliases for the two joins
     local loc_spells_tbl  "constructed_data.addr_spells"
     local loc_bldg_tbl    "constructed_data.addr_bldg_geography"
@@ -250,10 +262,10 @@ program define ccp_query
     local loc_sfx_addr_spells         "loc"
     local loc_sfx_addr_bldg_geography "bg"
     //     Columns of addr_spells. addr_spells carries every spell's geography
-    //     (2000/2010/2020 tract, block group and block GEOIDs, school zones),
+    //     (2000/2010/2020 tract, block group and block GEOIDs),
     //     so location_geo() reads these from it directly; any other column
     //     comes from addr_bldg_geography (building-level details)
-    local loc_spell_cols "zip state_fips county_geoid tract_geoid_00 tract_geoid_10 tract_geoid_20 blkgrp_geoid_00 blkgrp_geoid_10 blkgrp_geoid_20 block_geoid_00 block_geoid_10 block_geoid_20 geo_src_00 geo_src_10 geo_src_20 primary_school_name primary_school_id primary_lea_id middle_school_name middle_school_id middle_lea_id high_school_name high_school_id high_lea_id spell_type start_basis end_basis first_anchor_date last_anchor_date blips_merged zip_state_conflict"
+    local loc_spell_cols "zip state_fips county_geoid tract_geoid_00 tract_geoid_10 tract_geoid_20 blkgrp_geoid_00 blkgrp_geoid_10 blkgrp_geoid_20 block_geoid_00 block_geoid_10 block_geoid_20 geo_src_00 geo_src_10 geo_src_20 spell_type start_basis end_basis first_anchor_date last_anchor_date blips_merged zip_state_conflict"
 
     // --- NEW (1.5.0): geography sources for basic_cleaning (see section 3b) ---
     //     geo_xwalk_pattern: an extra table whose name (after the schema)
@@ -264,7 +276,7 @@ program define ccp_query
     //       listed (school zones, addr_id, flags, ...) become geo_<column>.
     local geo_xwalk_pattern "^addr_geo_xwalk"
     local geo_attr_map    "zip_cd geo_zip state_cd geo_stabbr fips_state geo_state fips_county geo_county census_tract geo_tract census_blk_grp geo_blkgrp census_blk_id geo_blk"
-    local geo_xw_map      "zip_cd geo_zip zip_cd_reported geo_zip_reported state_cd geo_stabbr fips_state_cd geo_state county_fips3 geo_county"
+    local geo_xw_map      "zip geo_zip zip_reported geo_zip_reported state_fips geo_state county_geoid geo_county_geoid zip_cd geo_zip zip_cd_reported geo_zip_reported state_cd geo_stabbr fips_state_cd geo_state county_fips3 geo_county"
     local geo_xw_vint_map "census_tract_cd geo_tract census_blk_grp_cd geo_blkgrp census_blk_id geo_blk census_blk_full_cd geo_blkfull census_tract_geoid geo_tractid"
 
     // --- ODBC data-source name (DSN) ------------------------------------------
@@ -476,7 +488,7 @@ program define ccp_query
     //
     //       filter_file(path.csv)  CSV with exactly one column. The header
     //                              is the filter-table column to match on
-    //                              (e.g. primary_school_id, fips_cd); each
+    //                              (e.g. county_geoid, tract_geoid_10); each
     //                              row is one value to keep. Values are read
     //                              as text, so leading zeros in the file are
     //                              preserved (but not restored if lost).
@@ -549,7 +561,7 @@ program define ccp_query
             local n_fcols : word count `filter_col'
             if `n_fcols' != 1 {
                 di as error "filter_file() must contain exactly one column (found `n_fcols': `filter_col')."
-                di as error "The header should be the name of the filter-table column to match on, e.g. primary_school_id."
+                di as error "The header should be the name of the filter-table column to match on, e.g. county_geoid."
                 exit 198
             }
             // import delimited renames headers that aren't valid Stata names
@@ -637,8 +649,8 @@ program define ccp_query
     //                              ZIP, state, county and dates
     //       location_geo(cols)     also add these columns, as geo_loc_<col>:
     //                              from addr_spells when it has them (e.g.
-    //                              tract_geoid_10, block_geoid_20,
-    //                              primary_school_id), else addr_bldg_geography
+    //                              tract_geoid_10, block_geoid_20), else
+    //                              addr_bldg_geography
     //       location_drop(stats)   drop records with these statuses in SQL
     //                              (from loc_statuses), e.g. no_longer_hashed
     //     The driver file can also list columns with source = addr_spells or
@@ -988,7 +1000,7 @@ program define ccp_query
         local loc_names "geo_loc_status geo_loc_addr_id geo_loc_bldg_id geo_loc_zip geo_loc_state_fips geo_loc_county_geoid geo_loc_valid_from geo_loc_valid_to"
 
         // location_geo(): from addr_spells when it carries the column (all
-        // census geography and school zones), else from addr_bldg_geography
+        // census geography), else from addr_bldg_geography
         local loc_geo_bldg ""
         foreach c of local loc_geo_cols {
             if `: list c in loc_spell_cols' {
@@ -1351,8 +1363,13 @@ program define ccp_query
             // ------------------------------------------------------------------
             // 6b.  Execute ODBC query
             // ------------------------------------------------------------------
-            //TODO: print query even if it runs!
-			capture {
+            // CHANGED (1.8.0): memory is emptied explicitly before each load
+            // (odbc load's own clear option did not always do it, which made
+            // the second archive fail with r(18) "you must start with an empty
+            // dataset"), and the load runs under capture noisily so that the
+            // ODBC / SQL Server message is shown if it fails
+            quietly clear
+            capture noisily {
                 quietly odbc load, exec(`"`sql_query'"') dsn("`dsn'") clear
             }
             if _rc {
