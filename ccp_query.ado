@@ -1,5 +1,5 @@
 *! ccp_query.ado
-*! Version 1.8.0
+*! Version 1.8.1
 *! Executes ODBC SQL queries across quarterly data archives
 *! Archives are named by scope (ca/national), quarter-month (MMYYYY), and source
 *! (attribute, trade, inquiry, public)
@@ -66,6 +66,16 @@
 *!        zip_cd from both attribute and the crosswalk) is now selected as
 *!        <column>_<alias> instead of producing a duplicate column, which
 *!        made the ODBC load fail.
+*!
+*! CHANGELOG (1.8.1):
+*!   FIX:  basic_cleaning's tradeline collapse kept only by() variables named
+*!        person_* or geo_*, so other person-level columns were dropped
+*!        without warning (e.g. birth_yr and sex from extra table
+*!        constructed_data.ctk_demog, homeowner_in, file_year). Every
+*!        attribute column, and every column of an extra table joined only
+*!        on attribute columns (e.g. ctk), is now kept as a by() variable.
+*!        Any other requested non-tradeline column the collapse drops is
+*!        named in a NOTE.
 *!
 *! CHANGELOG (1.8.0):
 *!   NEW:  location / location_geo() / location_drop() add where each person
@@ -890,6 +900,19 @@ program define ccp_query
         }
     }
 
+    // NEW (1.8.1): person-level columns. Attribute columns, and columns of
+    //   extra tables joined only on attribute columns (e.g. ctk_demog on
+    //   ctk), are constant within a person-quarter. Their received names
+    //   go in person_carry so basic_cleaning keeps them through the
+    //   tradeline collapse (phase 3).
+    local person_lvl_aliases ""
+    forvalues k = 1/`n_extra_tables' {
+        local keys_k = lower("`extra_keys_`k''")
+        local attr_k "ctk `varlist_attribute'"
+        if `: list keys_k in attr_k' local person_lvl_aliases "`person_lvl_aliases' `extra_alias_`k''"
+    }
+    local person_carry ""
+
     local select_cols_all ""
     local selected_names  ""
     local n_geo_xw 0
@@ -930,6 +953,10 @@ program define ccp_query
                 local select_cols_all "`select_cols_all', `src'.`vv'"
             }
             local selected_names "`selected_names' `recv'"
+            // NEW (1.8.1): record person-level columns (see above)
+            if "`src'" == "attribute" | `: list src in person_lvl_aliases' {
+                local person_carry "`person_carry' `recv'"
+            }
 
             // Cleaned name for each crosswalk column
             if `is_geo_xw' {
@@ -1817,12 +1844,37 @@ program define ccp_query
 								*	user
 								local collapse_cmd = "`args_mean_list' `args_sum_list' `args_max_list'"
 								
+								*NEW (1.8.1): keep person-level columns that were
+								*	not renamed to person_*/geo_* (e.g. birth_yr and
+								*	sex from ctk_demog, homeowner_in) as by() variables
+								foreach v of local person_carry {
+									if "`v'" == "ctk" | regexm("`v'", "^(person_|geo_|_archive_|credit_)") | regexm("`v'", "_(util|pctp)_") continue
+									cap confirm variable `v', exact
+									if !_rc local args_by_list "`args_by_list' `v'"
+								}
+								
 							//collapse the data if there's actually data to collapse
 							if trim("`collapse_cmd'") != "" {
+								qui ds
+								local vars_pre `r(varlist)'
+								
 								gcollapse `args_mean_list' `args_sum_list' `args_max_list', ///
 									  by(ctk _archive_* `args_by_list')
 									  
 								gisid ctk _archive_mmyyyy
+								
+								*NEW (1.8.1): name any requested non-tradeline column
+								*	that the collapse dropped (first archive only)
+								if `arc_count' == 1 {
+									qui ds
+									local vars_post `r(varlist)'
+									local gone : list vars_pre - vars_post
+									local gone : list gone & selected_names
+									local gone : list gone - varlist_trade
+									local gone : list gone - varlist_inquiry
+									local gone : list gone - varlist_public
+									if "`gone'" != "" di as text "NOTE: dropped when collapsing tradelines to person-quarters: `gone'"
+								}
 							}
 							
 							else {
